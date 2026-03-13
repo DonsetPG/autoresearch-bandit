@@ -1,7 +1,8 @@
 """
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+Usage: uv run train_bandit.py
+Optional env metadata: AUTORESEARCH_RUN_TAG, AUTORESEARCH_RUN_ID, AUTORESEARCH_ARM, AUTORESEARCH_NOTE
 """
 
 import os
@@ -9,6 +10,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
+import json
 import math
 import time
 from dataclasses import dataclass, asdict
@@ -451,6 +453,21 @@ DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
+# Optional run metadata (for outer-loop bandit orchestration)
+# ---------------------------------------------------------------------------
+
+def _env_text(name, default=""):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip()
+
+RUN_TAG = _env_text("AUTORESEARCH_RUN_TAG")
+RUN_ID = _env_text("AUTORESEARCH_RUN_ID")
+RUN_ARM = _env_text("AUTORESEARCH_ARM")
+RUN_NOTE = _env_text("AUTORESEARCH_NOTE")
+
+# ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
 
@@ -539,6 +556,10 @@ t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
 step = 0
+steady_tok_per_sec_accum = 0.0
+steady_mfu_accum = 0.0
+steady_logged_steps = 0
+max_train_loss = 0.0
 
 while True:
     torch.cuda.synchronize()
@@ -565,6 +586,7 @@ while True:
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()
+    max_train_loss = max(max_train_loss, train_loss_f)
 
     # Fast fail: abort if loss is exploding or NaN
     if math.isnan(train_loss_f) or train_loss_f > 100:
@@ -577,6 +599,9 @@ while True:
 
     if step > 10:
         total_training_time += dt
+        steady_tok_per_sec_accum += TOTAL_BATCH_SIZE / dt
+        steady_mfu_accum += 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+        steady_logged_steps += 1
 
     # Logging
     ema_beta = 0.9
@@ -622,9 +647,50 @@ print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
+steady_tok_per_sec = steady_tok_per_sec_accum / steady_logged_steps if steady_logged_steps > 0 else 0.0
+mean_mfu_percent = steady_mfu_accum / steady_logged_steps if steady_logged_steps > 0 else 0.0
+num_flops_per_token_g = num_flops_per_token / 1e9
+peak_vram_gb = peak_vram_mb / 1024.0
+final_train_loss_ema = debiased_smooth_loss if step > 0 else float('nan')
+
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
+print(f"peak_vram_gb:     {peak_vram_gb:.3f}")
 print(f"mfu_percent:      {steady_state_mfu:.2f}")
+print(f"mean_mfu_percent: {mean_mfu_percent:.2f}")
+print(f"steady_tok_per_sec: {steady_tok_per_sec:.1f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
+print(f"num_flops_per_token_G: {num_flops_per_token_g:.3f}")
+print(f"final_train_loss_ema: {final_train_loss_ema:.6f}")
+print(f"max_train_loss:   {max_train_loss:.6f}")
 print(f"depth:            {DEPTH}")
+print(f"run_tag:          {RUN_TAG}")
+print(f"run_id:           {RUN_ID}")
+print(f"run_arm:          {RUN_ARM}")
+print(f"run_note:         {RUN_NOTE}")
+
+run_summary = {
+    "status": "ok",
+    "val_bpb": float(val_bpb),
+    "training_seconds": float(total_training_time),
+    "total_seconds": float(t_end - t_start),
+    "startup_seconds": float(startup_time),
+    "peak_vram_mb": float(peak_vram_mb),
+    "peak_vram_gb": float(peak_vram_gb),
+    "mfu_percent": float(steady_state_mfu),
+    "mean_mfu_percent": float(mean_mfu_percent),
+    "steady_tok_per_sec": float(steady_tok_per_sec),
+    "total_tokens_M": float(total_tokens / 1e6),
+    "num_steps": int(step),
+    "num_params_M": float(num_params / 1e6),
+    "num_flops_per_token_G": float(num_flops_per_token_g),
+    "final_train_loss_ema": float(final_train_loss_ema),
+    "max_train_loss": float(max_train_loss),
+    "depth": int(DEPTH),
+    "run_tag": RUN_TAG,
+    "run_id": RUN_ID,
+    "run_arm": RUN_ARM,
+    "run_note": RUN_NOTE,
+}
+print("run_summary_json: " + json.dumps(run_summary, sort_keys=True))
