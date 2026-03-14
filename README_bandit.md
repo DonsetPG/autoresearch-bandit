@@ -1,115 +1,182 @@
 # autoresearch-bandit
 
-This is a multi-objective, bandit-driven variant of autoresearch.
+This is the objective-arm, multi-objective bandit version of autoresearch.
 
-The original repo is a single-objective outer loop: modify `train.py`, run for a fixed 5-minute budget, and keep the commit only when `val_bpb` gets lower. That design is clean and effective, but it collapses every tradeoff into one number. This variant keeps `val_bpb` as the primary quality metric while also optimizing speed, memory, inference cost, and stability at the orchestration layer.
+The original autoresearch loop hill-climbs a single metric: `val_bpb`. That is useful, but it collapses several real LLM tradeoffs into one number. In practice, model work usually tries to improve several things at the same time: quality, throughput, VRAM footprint, model size, and inference cost. This variant keeps the same fixed-time training setup, but changes the outer loop so the agent explores those tradeoffs explicitly.
+
+## Core idea
+
+A bandit arm here is **not** a code subsystem like optimizer or attention. A bandit arm is a **research objective**.
+
+The 5 implemented objective arms are:
+
+- `quality`  → lower `val_bpb`
+- `speed`    → higher `steady_tok_per_sec`
+- `memory`   → lower `peak_vram_gb`
+- `params`   → lower `num_params_M`
+- `cost`     → lower `num_flops_per_token_G`
+
+The agent may edit code **anywhere in the repo** to improve the chosen objective arm. The arm is the hypothesis label, not a file restriction.
 
 ## What stays fixed
 
-`prepare.py` is still read-only. It still defines the fixed data pipeline, tokenizer, time budget, and `evaluate_bpb` function. The training loss inside a single run is still standard next-token cross-entropy. The multi-objective logic lives outside the training step, in the agent loop that decides which experiment family to try next.
+For comparability, these items should stay fixed during a run:
 
-## What changes
+- dataset and split
+- tokenizer and tokenizer training
+- validation harness and `evaluate_bpb`
+- fixed wall-clock training budget
+- the reward equations used by the controller
+- the results schema used by the summary scripts
 
-This variant introduces four new pieces:
+Everything else can be changed: model architecture, optimizer logic, scheduling, kernels, helper files, code organization, and any new modules the agent wants to add.
 
-- **`train_bandit.py`** — the training script, based on the original `train.py`, but with richer end-of-run telemetry and a machine-readable `run_summary_json` line.
-- **`program_bandit.md`** — agent instructions for multi-objective search with a discrete multi-arm bandit over experiment families.
-- **`bandit_controller.py`** — helper CLI for `init`, `append`, `next-arm`, and `frontier`.
-- **`results.tsv`** — expanded run log with raw metrics and a scalarized reward.
-- **`summarize_bandit.py`** — turns `results.tsv` into a static figure and an animated GIF.
+## How the outer loop works
 
-## Objectives
+There are two independent pieces of logic.
 
-By default the controller optimizes 5 goals:
+First, the **bandit** chooses which objective arm should get the next experiment. It uses UCB1 over historical arm rewards.
 
-1. `val_bpb` — lower is better.
-2. `steady_tok_per_sec` — higher is better.
-3. `peak_vram_gb` — lower is better.
-4. `num_flops_per_token_G` — lower is better.
-5. stability — successful, non-crashing runs are better.
+Second, the **archive** decides whether the resulting run should be kept. A run is kept if it lies on the observed Pareto frontier over the 5 raw metrics.
 
-`mfu_percent` and `num_params_M` are logged as diagnostics.
+That means the workflow no longer has one single "best commit". It has an archive of frontier commits, each representing a different tradeoff point.
 
-## Bandit design
+## Reward model
 
-Each experiment family is treated as one arm:
+The first successful run is the baseline.
 
-- `retest_frontier`
-- `optimizer`
-- `schedule`
-- `shape`
-- `attention_rope`
-- `residual_ve`
-- `mlp_block`
-- `batch_efficiency`
+Each raw metric is normalized to a score in `[0, 1]` relative to that baseline:
 
-The outer loop uses a simple UCB policy over arm families. Reward is a weighted scalarization of the 5 objectives, with quality dominant. Keep / discard is based on Pareto dominance, not only on `val_bpb`.
+- quality score from `val_bpb`
+- speed score from `tok_per_sec`
+- memory score from `memory_gb`
+- params score from `num_params_m`
+- cost score from `flops_per_token_g`
 
-This gives two decision layers:
+The global multi-objective reward is:
 
-- **bandit allocation** decides which subsystem to explore next
-- **Pareto retention** decides whether the new commit should remain on the branch
-
-## Results schema
-
-`results.tsv` uses this header:
-
-```tsv
-experiment	commit	arm	val_bpb	memory_gb	tok_per_sec	mfu_percent	num_params_m	flops_per_token_g	reward	status	description
+```text
+global_reward =
+    0.40 * quality_score +
+    0.20 * speed_score   +
+    0.15 * memory_score  +
+    0.10 * params_score  +
+    0.15 * cost_score
 ```
 
-`status` is one of:
+The bandit update uses an arm-specific reward:
 
-- `keep`
-- `discard`
-- `crash`
+```text
+arm_reward = 0.65 * selected_objective_score + 0.35 * global_reward
+```
 
-## Figure design
+So if the chosen arm is `memory`, the bandit mostly cares about whether memory improved, but it still gets partial credit for improving the overall tradeoff picture.
 
-`summarize_bandit.py` produces a 2x2 summary figure:
+Crashes get zero reward.
 
-- **top-left:** scalarized bandit reward by experiment, plus running best utility
-- **top-right:** Pareto view of quality vs speed, with marker size proportional to memory
-- **bottom-left:** arm pulls, keep counts, and mean reward by arm
-- **bottom-right:** arm-pull timeline heatmap, where each cell shows reward for the selected arm on that experiment
+## Keep / discard rule
 
-It also produces a GIF that animates the same figure experiment by experiment.
+A successful run is `keep` if it is non-dominated on the 5D frontier:
+
+- minimize `val_bpb`
+- maximize `tok_per_sec`
+- minimize `memory_gb`
+- minimize `num_params_m`
+- minimize `flops_per_token_g`
+
+Otherwise it is `discard`.
+
+A crash is `crash`.
+
+## Why objective arms are better than code-area arms
+
+If the bandit arms were things like `optimizer`, `rope`, or `mlp`, the controller would be learning which subsystem seems promising, but it would not know *why* that subsystem is being changed. One optimizer change might be about speed, another about stability, and another about final quality.
+
+Objective arms are cleaner. They let the bandit learn which **goal** is currently most improvable, while still allowing the agent to search the whole codebase for mechanisms that serve that goal.
+
+## Files in this variant
+
+- `train_bandit.py` — training script with richer machine-readable telemetry at the end of each run
+- `bandit_controller.py` — selects the next objective arm, selects a parent frontier commit, computes rewards, and appends `results.tsv`
+- `summarize_bandit.py` — generates a static dashboard PNG and an animated GIF
+- `program_bandit.md` — operational instructions for an autonomous coding agent
+- `results_bandit_template.tsv` — header template for the results file
+
+## Git workflow
+
+Because there are multiple kept frontier points, do not rely on a single moving branch tip.
+
+When a run is kept, create a lightweight tag such as:
+
+```bash
+git tag -f frontier-exp-0012 <commit>
+```
+
+Later experiments can branch from whichever frontier commit best matches the chosen objective arm.
+
+## Main summary figure
+
+The default summary figure in this variant is a dashboard rather than a single scalar trace. It includes:
+
+- global multi-objective reward by experiment with a running-best line
+- quality vs speed scatter, with marker size encoding VRAM and color encoding objective arm
+- running-best normalized score for each objective
+- objective-arm pull counts and mean arm reward
+- a current-frontier summary card
+- an objective-arm timeline heatmap
+
+The GIF is the same dashboard animated over time, one experiment at a time.
 
 ## Quick start
 
 ```bash
-# 1. Run a single experiment
-AUTORESEARCH_RUN_TAG=mar13-bandit \
-AUTORESEARCH_RUN_ID=1 \
-AUTORESEARCH_ARM=optimizer \
-AUTORESEARCH_NOTE="baseline" \
-uv run train_bandit.py > run.log 2>&1
+# 1. Prepare the tokenizer and data once
+uv run prepare.py
 
-# 2. Append the result to results.tsv
-python bandit_controller.py append --results results.tsv --log run.log --commit "$(git rev-parse --short HEAD)" --arm optimizer --description "baseline"
+# 2. Initialize the results file
+python bandit_controller.py init --results results.tsv
 
-# 3. Choose the next arm
-python bandit_controller.py next-arm --results results.tsv
+# 3. Run one baseline experiment
+AUTORESEARCH_OBJECTIVE_ARM=quality uv run train_bandit.py > run.log 2>&1
 
-# 4. Generate summaries
-python summarize_bandit.py results.tsv --png bandit_progress.png --gif bandit_progress.gif
+# 4. Append the run
+python bandit_controller.py append \
+  --results results.tsv \
+  --log run.log \
+  --commit "$(git rev-parse --short HEAD)" \
+  --objective-arm quality \
+  --description "baseline"
+
+# 5. Generate the dashboard and GIF
+python summarize_bandit.py results.tsv \
+  --png bandit_progress.png \
+  --gif bandit_progress.gif
 ```
 
-## Recommended workflow
+## Planner helper
 
-1. Keep `prepare.py` unchanged.
-2. Let the agent operate mainly on `train_bandit.py`.
-3. Log every run to `results.tsv`.
-4. Recompute the next arm from the logged rewards.
-5. Regenerate the figure and GIF after each experiment or every few experiments.
+To ask the controller what to do next:
 
-## Why this is a better fit for multi-objective search
+```bash
+python bandit_controller.py next-plan --results results.tsv
+```
 
-A pure “best loss wins” loop is brittle when the repo must balance hardware cost and quality. A multi-objective bandit gives you:
+It returns JSON describing:
 
-- explicit control over tradeoffs
-- exploration pressure across research themes
-- a retained Pareto frontier instead of a single incumbent
-- a visual summary that reflects the real search space
+- the next objective arm
+- the parent frontier commit to branch from
+- why those choices were made
 
-If you later want more objectives, the clean extensions are downstream eval, inference latency, and robustness across seeds.
+## Notes on objective choice
+
+These 5 objectives were selected because they are available from the existing run summary and are useful across training and deployment tradeoffs.
+
+Other good objectives exist, but they are not implemented here by default because they require extra evaluation machinery per run, for example:
+
+- benchmark suites
+- long-context evals
+- sample quality judgments
+- latency measurements on a serving stack
+- safety / refusal / hallucination scoring
+
+Those can be added later if the fixed contract is expanded.

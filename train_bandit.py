@@ -2,7 +2,7 @@
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
 Usage: uv run train_bandit.py
-Optional env metadata: AUTORESEARCH_RUN_TAG, AUTORESEARCH_RUN_ID, AUTORESEARCH_ARM, AUTORESEARCH_NOTE
+Optional env metadata: AUTORESEARCH_RUN_TAG, AUTORESEARCH_RUN_ID, AUTORESEARCH_OBJECTIVE_ARM, AUTORESEARCH_PARENT_COMMIT, AUTORESEARCH_PARENT_EXPERIMENT, AUTORESEARCH_NOTE
 """
 
 import os
@@ -464,7 +464,9 @@ def _env_text(name, default=""):
 
 RUN_TAG = _env_text("AUTORESEARCH_RUN_TAG")
 RUN_ID = _env_text("AUTORESEARCH_RUN_ID")
-RUN_ARM = _env_text("AUTORESEARCH_ARM")
+RUN_OBJECTIVE_ARM = _env_text("AUTORESEARCH_OBJECTIVE_ARM") or _env_text("AUTORESEARCH_ARM")
+RUN_PARENT_COMMIT = _env_text("AUTORESEARCH_PARENT_COMMIT")
+RUN_PARENT_EXPERIMENT = _env_text("AUTORESEARCH_PARENT_EXPERIMENT")
 RUN_NOTE = _env_text("AUTORESEARCH_NOTE")
 
 # ---------------------------------------------------------------------------
@@ -667,7 +669,9 @@ print(f"max_train_loss:   {max_train_loss:.6f}")
 print(f"depth:            {DEPTH}")
 print(f"run_tag:          {RUN_TAG}")
 print(f"run_id:           {RUN_ID}")
-print(f"run_arm:          {RUN_ARM}")
+print(f"run_objective_arm: {RUN_OBJECTIVE_ARM}")
+print(f"run_parent_commit: {RUN_PARENT_COMMIT}")
+print(f"run_parent_experiment: {RUN_PARENT_EXPERIMENT}")
 print(f"run_note:         {RUN_NOTE}")
 
 run_summary = {
@@ -690,7 +694,10 @@ run_summary = {
     "depth": int(DEPTH),
     "run_tag": RUN_TAG,
     "run_id": RUN_ID,
-    "run_arm": RUN_ARM,
+    "run_objective_arm": RUN_OBJECTIVE_ARM,
+    "run_arm": RUN_OBJECTIVE_ARM,
+    "run_parent_commit": RUN_PARENT_COMMIT,
+    "run_parent_experiment": RUN_PARENT_EXPERIMENT,
     "run_note": RUN_NOTE,
 }
 print("run_summary_json: " + json.dumps(run_summary, sort_keys=True))

@@ -1,1 +1,1 @@
-experiment	commit	arm	val_bpb	memory_gb	tok_per_sec	mfu_percent	num_params_m	flops_per_token_g	reward	status	description
+experiment	parent_experiment	parent_commit	commit	objective_arm	val_bpb	tok_per_sec	memory_gb	num_params_m	flops_per_token_g	mfu_percent	startup_seconds	training_seconds	total_seconds	quality_score	speed_score	memory_score	params_score	cost_score	global_reward	arm_reward	status	description
