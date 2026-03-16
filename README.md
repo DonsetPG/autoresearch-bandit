@@ -1,5 +1,7 @@
 # autoresearch-bandit
 
+![image](bandit_story.gif)
+
 This is the objective-arm, multi-objective bandit version of autoresearch.
 
 The original autoresearch loop hill-climbs a single metric: `val_bpb`. That is useful, but it collapses several real LLM tradeoffs into one number. In practice, model work usually tries to improve several things at the same time: quality, throughput, VRAM footprint, model size, and inference cost. This variant keeps the same fixed-time training setup, but changes the outer loop so the agent explores those tradeoffs explicitly.
@@ -8,12 +10,11 @@ The original autoresearch loop hill-climbs a single metric: `val_bpb`. That is u
 
 A bandit arm here is **not** a code subsystem like optimizer or attention. A bandit arm is a **research objective**.
 
-The 5 implemented objective arms are:
+The 4 implemented objective arms are:
 
 - `quality`  → lower `val_bpb`
 - `speed`    → higher `steady_tok_per_sec`
 - `memory`   → lower `peak_vram_gb`
-- `params`   → lower `num_params_M`
 - `cost`     → lower `num_flops_per_token_G`
 
 The agent may edit code **anywhere in the repo** to improve the chosen objective arm. The arm is the hypothesis label, not a file restriction.
@@ -28,6 +29,7 @@ For comparability, these items should stay fixed during a run:
 - fixed wall-clock training budget
 - the reward equations used by the controller
 - the results schema used by the summary scripts
+- number of parameters
 
 Everything else can be changed: model architecture, optimizer logic, scheduling, kernels, helper files, code organization, and any new modules the agent wants to add.
 
@@ -50,7 +52,6 @@ Each raw metric is normalized to a score in `[0, 1]` relative to that baseline:
 - quality score from `val_bpb`
 - speed score from `tok_per_sec`
 - memory score from `memory_gb`
-- params score from `num_params_m`
 - cost score from `flops_per_token_g`
 
 The global multi-objective reward is:
@@ -58,9 +59,8 @@ The global multi-objective reward is:
 ```text
 global_reward =
     0.40 * quality_score +
-    0.20 * speed_score   +
-    0.15 * memory_score  +
-    0.10 * params_score  +
+    0.25 * speed_score   +
+    0.20 * memory_score  +
     0.15 * cost_score
 ```
 
@@ -76,23 +76,16 @@ Crashes get zero reward.
 
 ## Keep / discard rule
 
-A successful run is `keep` if it is non-dominated on the 5D frontier:
+A successful run is `keep` if it is non-dominated on the 4D frontier:
 
 - minimize `val_bpb`
 - maximize `tok_per_sec`
 - minimize `memory_gb`
-- minimize `num_params_m`
 - minimize `flops_per_token_g`
 
 Otherwise it is `discard`.
 
 A crash is `crash`.
-
-## Why objective arms are better than code-area arms
-
-If the bandit arms were things like `optimizer`, `rope`, or `mlp`, the controller would be learning which subsystem seems promising, but it would not know *why* that subsystem is being changed. One optimizer change might be about speed, another about stability, and another about final quality.
-
-Objective arms are cleaner. They let the bandit learn which **goal** is currently most improvable, while still allowing the agent to search the whole codebase for mechanisms that serve that goal.
 
 ## Files in this variant
 
